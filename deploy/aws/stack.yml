@@ -1,0 +1,245 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  custody-ledger on one EC2 instance (Docker Compose: Postgres, API, relay,
+  Caddy for automatic HTTPS), an ECR repository for images, and a GitHub
+  Actions role that can push images and trigger deploys. No long lived AWS
+  keys are created; GitHub authenticates with OIDC.
+
+Parameters:
+  GitHubRepo:
+    Type: String
+    Default: vaibenz/custody-ledger
+    Description: owner/repo allowed to deploy (main branch only)
+  AdminToken:
+    Type: String
+    NoEcho: true
+    MinLength: 32
+    AllowedPattern: "^[A-Za-z0-9_-]+$"
+    ConstraintDescription: 32 or more letters, digits, dash or underscore
+    Description: Root token for the API, e.g. the output of `openssl rand -hex 32`
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    Description: t3.micro is free tier eligible on older accounts
+  CreateGitHubOIDCProvider:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Set false if this AWS account already has the GitHub OIDC provider
+  AmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+Conditions:
+  MakeOIDC: !Equals [!Ref CreateGitHubOIDCProvider, "true"]
+
+Resources:
+  Repository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: custody-ledger
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: >
+          {"rules":[{"rulePriority":1,"description":"keep the last 20 images",
+          "selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":20},
+          "action":{"type":"expire"}}]}
+
+  PublicIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  WebSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: HTTPS for the custody-ledger API. No SSH; use SSM Session Manager.
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0, Description: ACME challenge and redirect }
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0, Description: HTTPS }
+
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref InstanceRole]
+
+  Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref AmiId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref InstanceProfile
+      SecurityGroupIds: [!GetAtt WebSecurityGroup.GroupId]
+      MetadataOptions:
+        HttpTokens: required
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs: { VolumeSize: 20, VolumeType: gp3, Encrypted: true }
+      Tags:
+        - { Key: Name, Value: custody-ledger }
+      UserData:
+        Fn::Base64: !Sub
+          - |
+            #!/bin/bash
+            set -euo pipefail
+
+            # 1 GB of swap so Postgres and the Go services fit on a micro instance.
+            fallocate -l 1G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile
+            echo '/swapfile swap swap defaults 0 0' >> /etc/fstab
+
+            dnf install -y docker
+            systemctl enable --now docker
+            mkdir -p /usr/local/lib/docker/cli-plugins
+            curl -fsSL "https://github.com/docker/compose/releases/download/v2.29.7/docker-compose-linux-x86_64" \
+              -o /usr/local/lib/docker/cli-plugins/docker-compose
+            chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+
+            mkdir -p /opt/ledger
+            cd /opt/ledger
+            umask 077
+            cat > .env <<ENV
+            REGISTRY=${Registry}
+            IMAGE_TAG=
+            DOMAIN=${Domain}
+            ADMIN_TOKEN=${AdminToken}
+            POSTGRES_PASSWORD=$(openssl rand -hex 24)
+            ENV
+
+            cat > Caddyfile <<'CADDY'
+            {$DOMAIN} {
+              reverse_proxy api:8080
+            }
+            CADDY
+
+            cat > compose.yml <<'COMPOSE'
+            services:
+              db:
+                image: postgres:16-alpine
+                environment:
+                  POSTGRES_USER: ledger
+                  POSTGRES_PASSWORD: ${!POSTGRES_PASSWORD}
+                  POSTGRES_DB: ledger
+                volumes: [pgdata:/var/lib/postgresql/data]
+                healthcheck:
+                  test: ["CMD-SHELL", "pg_isready -U ledger"]
+                  interval: 2s
+                  retries: 30
+                restart: unless-stopped
+              api:
+                image: ${!REGISTRY}:api-${!IMAGE_TAG}
+                depends_on: { db: { condition: service_healthy } }
+                environment:
+                  DATABASE_URL: postgres://ledger:${!POSTGRES_PASSWORD}@db:5432/ledger?sslmode=disable
+                  ADMIN_TOKEN: ${!ADMIN_TOKEN}
+                restart: unless-stopped
+              relay:
+                image: ${!REGISTRY}:relay-${!IMAGE_TAG}
+                depends_on: { db: { condition: service_healthy } }
+                environment:
+                  DATABASE_URL: postgres://ledger:${!POSTGRES_PASSWORD}@db:5432/ledger?sslmode=disable
+                restart: unless-stopped
+              caddy:
+                image: caddy:2-alpine
+                ports: ["80:80", "443:443"]
+                environment:
+                  DOMAIN: ${!DOMAIN}
+                volumes:
+                  - ./Caddyfile:/etc/caddy/Caddyfile:ro
+                  - caddy_data:/data
+                restart: unless-stopped
+            volumes:
+              pgdata:
+              caddy_data:
+            COMPOSE
+
+            # The API image arrives on the first deploy from GitHub Actions.
+            docker compose up -d db caddy
+          - Registry: !GetAtt Repository.RepositoryUri
+            # sslip.io resolves 1-2-3-4.sslip.io to 1.2.3.4, which lets Caddy
+            # get a real Let's Encrypt certificate without buying a domain.
+            Domain: !Join ["", [!Join ["-", !Split [".", !Ref PublicIP]], ".sslip.io"]]
+
+  IPAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      AllocationId: !GetAtt PublicIP.AllocationId
+      InstanceId: !Ref Instance
+
+  GitHubOIDC:
+    Type: AWS::IAM::OIDCProvider
+    Condition: MakeOIDC
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList: [sts.amazonaws.com]
+
+  DeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Assumed by GitHub Actions on the main branch to push images and deploy
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub arn:aws:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                token.actions.githubusercontent.com:sub: !Sub repo:${GitHubRepo}:ref:refs/heads/main
+      Policies:
+        - PolicyName: deploy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:PutImage
+                  - ecr:BatchGetImage
+                Resource: !GetAtt Repository.Arn
+              - Effect: Allow
+                Action: ssm:SendCommand
+                Resource:
+                  - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/${Instance}
+                  - !Sub arn:aws:ssm:${AWS::Region}::document/AWS-RunShellScript
+              - Effect: Allow
+                Action:
+                  - ssm:GetCommandInvocation
+                  - ssm:ListCommandInvocations
+                Resource: "*"
+              - Effect: Allow
+                Action: cloudformation:DescribeStacks
+                Resource: !Ref AWS::StackId
+
+Outputs:
+  DeployRoleArn:
+    Description: Paste into the GitHub repo variable AWS_ROLE_ARN
+    Value: !GetAtt DeployRole.Arn
+  URL:
+    Description: Public HTTPS address of the API
+    Value: !Join ["", ["https://", !Join ["-", !Split [".", !Ref PublicIP]], ".sslip.io"]]
+  InstanceId:
+    Value: !Ref Instance
+  RepositoryUri:
+    Value: !GetAtt Repository.RepositoryUri
