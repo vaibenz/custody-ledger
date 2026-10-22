@@ -14,6 +14,7 @@ import (
 	"github.com/lib/pq"
 
 	"github.com/vaibenz/custody-ledger/internal/audit"
+	"github.com/vaibenz/custody-ledger/internal/outbox"
 	"github.com/vaibenz/custody-ledger/internal/risk"
 )
 
@@ -210,6 +211,9 @@ func (s *Store) RequestWithdrawal(ctx context.Context, accountID uuid.UUID, addr
 				return err
 			}
 			w.Status, w.DecidedAt, finalTxn = StatusApproved, &now, &txn.ID
+			if err := enqueueSend(ctx, tx, w, asset); err != nil {
+				return err
+			}
 		case risk.Review:
 			hold, err := s.systemAccount(ctx, tx, asset, KindHold)
 			if err != nil {
@@ -332,6 +336,12 @@ func (s *Store) ReviewWithdrawal(ctx context.Context, id uuid.UUID, approve bool
 			return err
 		}
 
+		if approve {
+			if err := enqueueSend(ctx, tx, w, asset); err != nil {
+				return err
+			}
+		}
+
 		now := s.Now()
 		w.DecidedAt = &now
 		_, err = tx.ExecContext(ctx, `
@@ -346,6 +356,22 @@ func (s *Store) ReviewWithdrawal(ctx context.Context, id uuid.UUID, approve bool
 			map[string]any{"reviewer": reviewer, "approvals": w.Approvals})
 	})
 	return w, err
+}
+
+// TopicWithdrawalSend is the outbox topic a signer consumes to broadcast
+// approved withdrawals on chain.
+const TopicWithdrawalSend = "withdrawal.send"
+
+// enqueueSend announces an approved withdrawal in the same transaction that
+// approves it. The withdrawal id is the consumer's idempotency key.
+func enqueueSend(ctx context.Context, tx *sql.Tx, w Withdrawal, asset string) error {
+	return outbox.Enqueue(ctx, tx, TopicWithdrawalSend, w.ID.String(), map[string]any{
+		"withdrawal_id": w.ID,
+		"account_id":    w.AccountID,
+		"asset":         asset,
+		"address":       w.Address,
+		"amount":        w.Amount,
+	})
 }
 
 // PendingReviews lists held withdrawals, oldest first.

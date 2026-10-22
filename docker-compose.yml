@@ -27,5 +27,17 @@ services:
     ports:
       - "8080:8080"
 
+  relay:
+    build:
+      context: .
+      args:
+        CMD: relay
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://ledger:ledger@db:5432/ledger?sslmode=disable
+    restart: unless-stopped
+
 volumes:
   pgdata:

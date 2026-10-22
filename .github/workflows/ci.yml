@@ -44,4 +44,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Build image
-        run: docker build -t custody-ledger:${{ github.sha }} .
+        run: |
+          docker build -t custody-ledger:${{ github.sha }} .
+          docker build --build-arg CMD=relay -t custody-ledger-relay:${{ github.sha }} .

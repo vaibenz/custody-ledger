@@ -334,3 +334,49 @@ func TestConcurrentApprovalsSettleOnce(t *testing.T) {
 		t.Errorf("balance %d", got)
 	}
 }
+
+func sendEvents(t *testing.T, s *ledger.Store) []string {
+	t.Helper()
+	rows, err := s.DB().Query(`SELECT key FROM outbox WHERE topic = $1 ORDER BY id`, ledger.TopicWithdrawalSend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var keys []string
+	for rows.Next() {
+		var k string
+		rows.Scan(&k)
+		keys = append(keys, k)
+	}
+	return keys
+}
+
+func TestApprovalAnnouncesSendInTheSameTransaction(t *testing.T) {
+	s, _, a := setup(t)
+	ctx := context.Background()
+
+	auto, err := s.RequestWithdrawal(ctx, a.ID, addr, 100, "auto")
+	if err != nil || auto.Status != ledger.StatusApproved {
+		t.Fatalf("auto: %+v %v", auto, err)
+	}
+	if got := sendEvents(t, s); fmt.Sprint(got) != fmt.Sprint([]string{auto.ID.String()}) {
+		t.Fatalf("after auto approval: %v", got)
+	}
+
+	s.SetPolicy("BTC", risk.Policy{ReviewAbove: 1, ReviewApprovals: 2})
+	held, _ := s.RequestWithdrawal(ctx, a.ID, addr, 200, "held")
+	s.ReviewWithdrawal(ctx, held.ID, true, "ops-1")
+	if got := sendEvents(t, s); len(got) != 1 {
+		t.Fatalf("one approval of two must not announce: %v", got)
+	}
+	s.ReviewWithdrawal(ctx, held.ID, true, "ops-2")
+	if got := sendEvents(t, s); len(got) != 2 || got[1] != held.ID.String() {
+		t.Fatalf("after second approval: %v", got)
+	}
+
+	rejected, _ := s.RequestWithdrawal(ctx, a.ID, addr, 300, "rejected")
+	s.ReviewWithdrawal(ctx, rejected.ID, false, "ops-1")
+	if got := sendEvents(t, s); len(got) != 2 {
+		t.Errorf("rejected withdrawal announced: %v", got)
+	}
+}
