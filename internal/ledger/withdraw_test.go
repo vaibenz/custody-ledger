@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -242,5 +243,94 @@ func TestWithdrawalValidation(t *testing.T) {
 				t.Errorf("got %v, want %v", err, tc.want)
 			}
 		})
+	}
+}
+
+func fourEyes(t *testing.T) (*ledger.Store, ledger.Account, ledger.Withdrawal) {
+	t.Helper()
+	s, _, a := setup(t)
+	s.SetPolicy("BTC", risk.Policy{ReviewAbove: 1, ReviewApprovals: 2})
+	w, err := s.RequestWithdrawal(context.Background(), a.ID, addr, 1_000, "held")
+	if err != nil || w.Status != ledger.StatusPendingReview || w.ApprovalsRequired != 2 {
+		t.Fatalf("held: %+v %v", w, err)
+	}
+	return s, a, w
+}
+
+func TestFourEyesNeedsTwoDistinctApprovers(t *testing.T) {
+	s, a, w := fourEyes(t)
+	ctx := context.Background()
+
+	got, err := s.ReviewWithdrawal(ctx, w.ID, true, "alice-ops")
+	if err != nil || got.Status != ledger.StatusPendingReview || len(got.Approvals) != 1 {
+		t.Fatalf("first approval: %+v %v", got, err)
+	}
+	if _, err := s.ReviewWithdrawal(ctx, w.ID, true, "alice-ops"); !errors.Is(err, ledger.ErrAlreadyReviewed) {
+		t.Errorf("same reviewer twice: %v", err)
+	}
+	if got := balance(t, s, a.ID); got != 49_000 {
+		t.Errorf("funds should stay held: %d", got)
+	}
+
+	got, err = s.ReviewWithdrawal(ctx, w.ID, true, "bob-ops")
+	if err != nil || got.Status != ledger.StatusApproved || got.ReviewedBy != "alice-ops,bob-ops" {
+		t.Fatalf("second approval: %+v %v", got, err)
+	}
+	if _, err := s.ReviewWithdrawal(ctx, w.ID, true, "carol-ops"); !errors.Is(err, ledger.ErrNotPendingReview) {
+		t.Errorf("approval after settlement: %v", err)
+	}
+}
+
+func TestOneRejectionReleasesFunds(t *testing.T) {
+	s, a, w := fourEyes(t)
+	ctx := context.Background()
+	if _, err := s.ReviewWithdrawal(ctx, w.ID, true, "alice-ops"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.ReviewWithdrawal(ctx, w.ID, false, "bob-ops")
+	if err != nil || got.Status != ledger.StatusRejected {
+		t.Fatalf("reject: %+v %v", got, err)
+	}
+	if got := balance(t, s, a.ID); got != 50_000 {
+		t.Errorf("funds not released: %d", got)
+	}
+}
+
+// Many reviewers approving at the same moment must settle exactly once, with
+// exactly the required number of approvals recorded.
+func TestConcurrentApprovalsSettleOnce(t *testing.T) {
+	s, a, w := fourEyes(t)
+	ctx := context.Background()
+
+	var wg sync.WaitGroup
+	var settled, pending, closed atomic.Int32
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			got, err := s.ReviewWithdrawal(ctx, w.ID, true, fmt.Sprintf("ops-%d", i))
+			switch {
+			case errors.Is(err, ledger.ErrNotPendingReview):
+				closed.Add(1)
+			case err != nil:
+				t.Errorf("reviewer %d: %v", i, err)
+			case got.Status == ledger.StatusApproved:
+				settled.Add(1)
+			default:
+				pending.Add(1)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	if settled.Load() != 1 || pending.Load() != 1 || closed.Load() != 8 {
+		t.Errorf("settled %d pending %d closed %d", settled.Load(), pending.Load(), closed.Load())
+	}
+	final, _ := s.GetWithdrawal(ctx, w.ID)
+	if len(final.Approvals) != 2 {
+		t.Errorf("approvals recorded: %v", final.Approvals)
+	}
+	if got := balance(t, s, a.ID); got != 49_000 {
+		t.Errorf("balance %d", got)
 	}
 }

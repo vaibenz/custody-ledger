@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/vaibenz/custody-ledger/internal/api"
@@ -114,8 +115,16 @@ func TestEndToEndFlow(t *testing.T) {
 	if len(reviews) != 1 {
 		t.Fatalf("reviews %v", reviews)
 	}
-	decided := e.must(200, e.call(op, "POST", "/v1/reviews/"+wID+"/approve", nil, ""))
-	if decided["status"] != "approved" || decided["reviewed_by"] != "ops-1" {
+	// Four-eyes: one approval is not enough, and the same operator cannot
+	// approve twice.
+	first := e.must(200, e.call(op, "POST", "/v1/reviews/"+wID+"/approve", nil, ""))
+	if first["status"] != "pending_review" {
+		t.Errorf("after one approval %v", first)
+	}
+	e.must(409, e.call(op, "POST", "/v1/reviews/"+wID+"/approve", nil, ""))
+	op2 := e.must(201, e.call(rootToken, "POST", "/v1/admin/operators", map[string]any{"name": "ops-2"}, ""))["token"].(string)
+	decided := e.must(200, e.call(op2, "POST", "/v1/reviews/"+wID+"/approve", nil, ""))
+	if decided["status"] != "approved" || decided["reviewed_by"] != "ops-1,ops-2" {
 		t.Errorf("decided %v", decided)
 	}
 	if got := e.must(200, e.call(alice, "GET", "/v1/withdrawals/"+wID, nil, "")); got["status"] != "approved" {
@@ -128,7 +137,12 @@ func TestEndToEndFlow(t *testing.T) {
 	for _, x := range trail {
 		actors = append(actors, x.(map[string]any)["actor"].(string)+" "+x.(map[string]any)["action"].(string))
 	}
-	if len(actors) != 2 || actors[0] != "customer:alice withdrawal.requested" || actors[1] != "operator:ops-1 withdrawal.approved" {
+	want := []string{
+		"customer:alice withdrawal.requested",
+		"operator:ops-1 withdrawal.approval_recorded",
+		"operator:ops-2 withdrawal.approved",
+	}
+	if strings.Join(actors, "|") != strings.Join(want, "|") {
 		t.Errorf("audit trail %v", actors)
 	}
 }

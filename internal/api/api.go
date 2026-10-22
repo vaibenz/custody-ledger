@@ -424,6 +424,7 @@ func (s *Server) fail(w http.ResponseWriter, r *http.Request, err error) {
 	case errors.Is(err, ledger.ErrInsufficientFunds),
 		errors.Is(err, ledger.ErrIdempotencyKeyConflict),
 		errors.Is(err, ledger.ErrNotPendingReview),
+		errors.Is(err, ledger.ErrAlreadyReviewed),
 		errors.Is(err, auth.ErrNameTaken):
 		writeError(w, http.StatusConflict, err.Error())
 	case errors.Is(err, ledger.ErrInvalidAmount),

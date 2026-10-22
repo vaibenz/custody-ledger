@@ -44,14 +44,23 @@ type Policy struct {
 	// NewAddressHold sends withdrawals to an address added more recently
 	// than this to review, giving the real owner time to notice.
 	NewAddressHold time.Duration
+	// ReviewApprovals is how many distinct operators must approve a held
+	// withdrawal before it settles (four-eyes when 2). Zero means 1.
+	ReviewApprovals int
+}
+
+// Approvals returns the effective number of approvals required.
+func (p Policy) Approvals() int {
+	return max(p.ReviewApprovals, 1)
 }
 
 // DefaultPolicy is a conservative fallback for assets with no policy set.
 var DefaultPolicy = Policy{
-	DailyLimit:     1_000_000,
-	MaxPerHour:     5,
-	ReviewAbove:    250_000,
-	NewAddressHold: 24 * time.Hour,
+	DailyLimit:      1_000_000,
+	MaxPerHour:      5,
+	ReviewAbove:     250_000,
+	NewAddressHold:  24 * time.Hour,
+	ReviewApprovals: 2,
 }
 
 type Input struct {
