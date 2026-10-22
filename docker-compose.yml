@@ -22,7 +22,7 @@ services:
         condition: service_healthy
     environment:
       DATABASE_URL: postgres://ledger:ledger@db:5432/ledger?sslmode=disable
-      ADMIN_TOKEN: ${ADMIN_TOKEN:?set ADMIN_TOKEN, e.g. export ADMIN_TOKEN=$(openssl rand -hex 32)}
+      ADMIN_TOKEN: ${ADMIN_TOKEN:?set ADMIN_TOKEN to a long random string first}
       PORT: "8080"
     ports:
       - "8080:8080"
