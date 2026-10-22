@@ -41,6 +41,16 @@ func (s *Store) CreateAccount(ctx context.Context, owner, asset string) (Account
 	return a, err
 }
 
+// ExternalPosition is the asset's net position against the outside world,
+// summed over all external shards. It equals minus the total held in custody.
+func (s *Store) ExternalPosition(ctx context.Context, asset string) (int64, error) {
+	var total int64
+	err := s.db.QueryRowContext(ctx, `
+		SELECT COALESCE(SUM(balance), 0) FROM accounts
+		 WHERE asset = $1 AND kind = 'external'`, asset).Scan(&total)
+	return total, err
+}
+
 // ListAccounts returns an owner's accounts, oldest first.
 func (s *Store) ListAccounts(ctx context.Context, owner string) ([]Account, error) {
 	rows, err := s.db.QueryContext(ctx, `
@@ -61,22 +71,34 @@ func (s *Store) ListAccounts(ctx context.Context, owner string) ([]Account, erro
 	return out, rows.Err()
 }
 
+// ensureSystemAccounts creates the asset's hold account and its external
+// shards. It is idempotent, and raising ExternalShards later simply adds the
+// missing shards the next time an account for that asset is opened.
 func (s *Store) ensureSystemAccounts(ctx context.Context, asset string) error {
-	for _, kind := range []string{KindExternal, KindHold} {
-		if _, err := s.db.ExecContext(ctx, `
-			INSERT INTO accounts (id, owner, asset, kind) VALUES ($1, 'system', $2, $3)
-			ON CONFLICT (asset, kind) WHERE kind <> 'user' DO NOTHING`,
-			uuid.New(), asset, kind); err != nil {
+	for shard := 0; shard < max(s.ExternalShards, 1); shard++ {
+		if err := s.ensureSystem(ctx, asset, KindExternal, shard); err != nil {
 			return err
 		}
 	}
-	return nil
+	return s.ensureSystem(ctx, asset, KindHold, 0)
 }
 
+func (s *Store) ensureSystem(ctx context.Context, asset, kind string, shard int) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO accounts (id, owner, asset, kind, shard) VALUES ($1, 'system', $2, $3, $4)
+		ON CONFLICT (asset, kind, shard) WHERE kind <> 'user' DO NOTHING`,
+		uuid.New(), asset, kind, shard)
+	return err
+}
+
+// systemAccount returns one of the asset's accounts of the given kind. For
+// external accounts it picks a random shard, so concurrent postings spread
+// across shards instead of queueing on one row lock.
 func (s *Store) systemAccount(ctx context.Context, q querier, asset, kind string) (uuid.UUID, error) {
 	var id uuid.UUID
-	err := q.QueryRowContext(ctx,
-		`SELECT id FROM accounts WHERE asset = $1 AND kind = $2`, asset, kind).Scan(&id)
+	err := q.QueryRowContext(ctx, `
+		SELECT id FROM accounts WHERE asset = $1 AND kind = $2
+		 ORDER BY random() LIMIT 1`, asset, kind).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
 		return uuid.Nil, ErrAccountNotFound
 	}

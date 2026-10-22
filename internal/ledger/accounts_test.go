@@ -65,3 +65,24 @@ func TestDepositRejectsBadInput(t *testing.T) {
 		t.Errorf("unknown account: got %v", err)
 	}
 }
+
+func TestDepositsSpreadAcrossExternalShards(t *testing.T) {
+	s, pool := newStore(t)
+	ctx := context.Background()
+	a := mustAccount(t, s, "alice", "BTC")
+	for i := 0; i < 200; i++ {
+		mustDeposit(t, s, a.ID, 10)
+	}
+
+	var used int
+	pool.QueryRowContext(ctx,
+		`SELECT count(*) FROM accounts WHERE asset = 'BTC' AND kind = 'external' AND balance <> 0`).Scan(&used)
+	if used < 6 {
+		t.Errorf("only %d of 8 shards used across 200 deposits", used)
+	}
+	pos, err := s.ExternalPosition(ctx, "BTC")
+	if err != nil || pos != -2_000 {
+		t.Errorf("external position = %d, %v; want -2000", pos, err)
+	}
+	assertInvariants(t, pool)
+}

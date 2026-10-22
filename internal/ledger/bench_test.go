@@ -49,3 +49,38 @@ func BenchmarkTransfer(b *testing.B) {
 	})
 	b.ReportMetric(float64(b.N)/b.Elapsed().Seconds(), "transfers/s")
 }
+
+// BenchmarkDeposit shows the effect of sharding the external account. Every
+// deposit locks one external row, so with a single shard parallel deposits
+// queue on that lock.
+//
+//	go test ./internal/ledger -run '^$' -bench Deposit -cpu 8
+func BenchmarkDeposit(b *testing.B) {
+	for _, shards := range []int{1, 8} {
+		b.Run(fmt.Sprintf("shards=%d", shards), func(b *testing.B) {
+			s := ledger.NewStore(testdb.New(b))
+			s.ExternalShards = shards
+			ctx := context.Background()
+			ids := make([]uuid.UUID, 100)
+			for i := range ids {
+				a, err := s.CreateAccount(ctx, fmt.Sprintf("u%d", i), "BTC")
+				if err != nil {
+					b.Fatal(err)
+				}
+				ids[i] = a.ID
+			}
+			var seq atomic.Int64
+			b.ResetTimer()
+			b.RunParallel(func(pb *testing.PB) {
+				for pb.Next() {
+					id := ids[rand.IntN(len(ids))]
+					if _, err := s.Deposit(ctx, id, 1, fmt.Sprintf("d-%d", seq.Add(1))); err != nil {
+						b.Error(err)
+						return
+					}
+				}
+			})
+			b.ReportMetric(float64(b.N)/b.Elapsed().Seconds(), "deposits/s")
+		})
+	}
+}

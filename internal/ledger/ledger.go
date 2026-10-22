@@ -82,13 +82,16 @@ type Store struct {
 	db *sql.DB
 	// Now is the clock used for time windows. Tests override it.
 	Now func() time.Time
+	// ExternalShards is how many external accounts each asset is spread
+	// over. Set before any account is opened.
+	ExternalShards int
 
 	mu       sync.RWMutex
 	policies map[string]risk.Policy
 }
 
 func NewStore(db *sql.DB) *Store {
-	return &Store{db: db, Now: time.Now}
+	return &Store{db: db, Now: time.Now, ExternalShards: 8}
 }
 
 // DB exposes the pool for read only helpers such as the audit log.
