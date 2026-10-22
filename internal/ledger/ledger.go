@@ -14,10 +14,13 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/lib/pq"
+
+	"github.com/vaibenz/custody-ledger/internal/risk"
 )
 
 var (
@@ -79,6 +82,9 @@ type Store struct {
 	db *sql.DB
 	// Now is the clock used for time windows. Tests override it.
 	Now func() time.Time
+
+	mu       sync.RWMutex
+	policies map[string]risk.Policy
 }
 
 func NewStore(db *sql.DB) *Store {
