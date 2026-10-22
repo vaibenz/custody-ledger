@@ -5,6 +5,8 @@ import (
 	"database/sql"
 
 	"github.com/google/uuid"
+
+	"github.com/vaibenz/custody-ledger/internal/audit"
 )
 
 // Transfer moves amount between two customer accounts holding the same
@@ -32,7 +34,11 @@ func (s *Store) Transfer(ctx context.Context, from, to uuid.UUID, amount int64, 
 			{account: from, amount: -amount},
 			{account: to, amount: amount},
 		})
-		return err
+		if err != nil || txn.Replayed {
+			return err
+		}
+		return audit.Write(ctx, tx, audit.Actor(ctx), "transfer", from.String(),
+			map[string]any{"to": to, "amount": amount, "transaction_id": txn.ID})
 	})
 	return txn, err
 }

@@ -8,6 +8,8 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
+
+	"github.com/vaibenz/custody-ledger/internal/audit"
 )
 
 var assetPattern = regexp.MustCompile(`^[A-Z]{2,10}$`)
@@ -26,11 +28,37 @@ func (s *Store) CreateAccount(ctx context.Context, owner, asset string) (Account
 		return Account{}, err
 	}
 	a := Account{ID: uuid.New(), Owner: owner, Asset: asset, Kind: KindUser}
-	err := s.db.QueryRowContext(ctx, `
-		INSERT INTO accounts (id, owner, asset, kind) VALUES ($1, $2, $3, 'user')
-		RETURNING balance, created_at`, a.ID, owner, asset,
-	).Scan(&a.Balance, &a.CreatedAt)
+	err := s.withTx(ctx, func(tx *sql.Tx) error {
+		if err := tx.QueryRowContext(ctx, `
+			INSERT INTO accounts (id, owner, asset, kind) VALUES ($1, $2, $3, 'user')
+			RETURNING balance, created_at`, a.ID, owner, asset,
+		).Scan(&a.Balance, &a.CreatedAt); err != nil {
+			return err
+		}
+		return audit.Write(ctx, tx, audit.Actor(ctx), "account.created", a.ID.String(),
+			map[string]any{"owner": owner, "asset": asset})
+	})
 	return a, err
+}
+
+// ListAccounts returns an owner's accounts, oldest first.
+func (s *Store) ListAccounts(ctx context.Context, owner string) ([]Account, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, owner, asset, kind, balance, created_at
+		  FROM accounts WHERE owner = $1 AND kind = 'user' ORDER BY created_at, id`, owner)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Account{}
+	for rows.Next() {
+		var a Account
+		if err := rows.Scan(&a.ID, &a.Owner, &a.Asset, &a.Kind, &a.Balance, &a.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
 }
 
 func (s *Store) ensureSystemAccounts(ctx context.Context, asset string) error {
@@ -93,7 +121,11 @@ func (s *Store) Deposit(ctx context.Context, accountID uuid.UUID, amount int64, 
 			{account: external, amount: -amount},
 			{account: accountID, amount: amount},
 		})
-		return err
+		if err != nil || txn.Replayed {
+			return err
+		}
+		return audit.Write(ctx, tx, audit.Actor(ctx), "deposit", accountID.String(),
+			map[string]any{"amount": amount, "transaction_id": txn.ID})
 	})
 	return txn, err
 }

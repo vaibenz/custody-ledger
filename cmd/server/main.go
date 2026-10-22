@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/vaibenz/custody-ledger/internal/api"
+	"github.com/vaibenz/custody-ledger/internal/auth"
 	"github.com/vaibenz/custody-ledger/internal/db"
 	"github.com/vaibenz/custody-ledger/internal/ledger"
 )
@@ -48,12 +49,12 @@ func run(log *slog.Logger) error {
 
 	adminToken := os.Getenv("ADMIN_TOKEN")
 	if adminToken == "" {
-		log.Warn("ADMIN_TOKEN not set; review endpoints are disabled")
+		log.Warn("ADMIN_TOKEN not set; no root credential, so no operators or keys can be created")
 	}
 
 	srv := &http.Server{
 		Addr:              addr,
-		Handler:           api.New(ledger.NewStore(pool), adminToken, log),
+		Handler:           api.New(ledger.NewStore(pool), auth.NewStore(pool, adminToken), log),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	errc := make(chan error, 1)

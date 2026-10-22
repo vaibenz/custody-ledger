@@ -91,6 +91,9 @@ func NewStore(db *sql.DB) *Store {
 	return &Store{db: db, Now: time.Now}
 }
 
+// DB exposes the pool for read only helpers such as the audit log.
+func (s *Store) DB() *sql.DB { return s.db }
+
 type querier interface {
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
 	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)

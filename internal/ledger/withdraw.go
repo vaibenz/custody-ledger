@@ -11,6 +11,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/lib/pq"
 
+	"github.com/vaibenz/custody-ledger/internal/audit"
 	"github.com/vaibenz/custody-ledger/internal/risk"
 )
 
@@ -81,14 +82,23 @@ func (s *Store) AddAddress(ctx context.Context, accountID uuid.UUID, address str
 		return Address{}, err
 	}
 	a := Address{AccountID: accountID, Address: address}
-	if _, err := s.db.ExecContext(ctx, `
-		INSERT INTO addresses (account_id, address, created_at) VALUES ($1, $2, $3)
-		ON CONFLICT DO NOTHING`, accountID, address, s.Now()); err != nil {
-		return Address{}, err
-	}
-	err := s.db.QueryRowContext(ctx,
-		`SELECT created_at FROM addresses WHERE account_id = $1 AND address = $2`,
-		accountID, address).Scan(&a.CreatedAt)
+	err := s.withTx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `
+			INSERT INTO addresses (account_id, address, created_at) VALUES ($1, $2, $3)
+			ON CONFLICT DO NOTHING`, accountID, address, s.Now())
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n == 1 {
+			if err := audit.Write(ctx, tx, audit.Actor(ctx), "address.added", accountID.String(),
+				map[string]any{"address": address}); err != nil {
+				return err
+			}
+		}
+		return tx.QueryRowContext(ctx,
+			`SELECT created_at FROM addresses WHERE account_id = $1 AND address = $2`,
+			accountID, address).Scan(&a.CreatedAt)
+	})
 	return a, err
 }
 
@@ -216,7 +226,12 @@ func (s *Store) RequestWithdrawal(ctx context.Context, accountID uuid.UUID, addr
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
 			w.ID, accountID, address, amount, w.Status, pq.Array(w.Reasons), key,
 			holdTxn, finalTxn, now, w.DecidedAt)
-		return err
+		if err != nil {
+			return err
+		}
+		return audit.Write(ctx, tx, audit.Actor(ctx), "withdrawal.requested", w.ID.String(),
+			map[string]any{"account_id": accountID, "address": address, "amount": amount,
+				"status": w.Status, "reasons": w.Reasons})
 	})
 	return w, err
 }
@@ -277,7 +292,11 @@ func (s *Store) ReviewWithdrawal(ctx context.Context, id uuid.UUID, approve bool
 			   SET status = $2, reasons = $3, final_txn = $4, reviewed_by = $5, decided_at = $6
 			 WHERE id = $1`,
 			w.ID, w.Status, pq.Array(w.Reasons), txn.ID, reviewer, now)
-		return err
+		if err != nil {
+			return err
+		}
+		return audit.Write(ctx, tx, audit.Actor(ctx), "withdrawal."+w.Status, w.ID.String(),
+			map[string]any{"reviewer": reviewer})
 	})
 	return w, err
 }
