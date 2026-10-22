@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/vaibenz/custody-ledger/internal/outbox"
 	"github.com/vaibenz/custody-ledger/internal/testdb"
@@ -121,5 +122,31 @@ func TestConcurrentRelaysDeliverEachEventOnce(t *testing.T) {
 		if n != 1 {
 			t.Errorf("event %s delivered %d times", k, n)
 		}
+	}
+}
+
+func TestRunDeliversUntilCancelled(t *testing.T) {
+	pool := testdb.New(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	outbox.Enqueue(ctx, pool, "t", "a", nil)
+
+	got := make(chan string, 1)
+	r := outbox.Relay{DB: pool, Handler: func(_ context.Context, e outbox.Event) error {
+		got <- e.Key
+		return nil
+	}}
+	done := make(chan error)
+	go func() { done <- r.Run(ctx, 10*time.Millisecond) }()
+	if k := <-got; k != "a" {
+		t.Errorf("delivered %q", k)
+	}
+	// Enqueued while running: picked up on a later poll.
+	outbox.Enqueue(context.Background(), pool, "t", "b", nil)
+	if k := <-got; k != "b" {
+		t.Errorf("delivered %q", k)
+	}
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Errorf("Run returned %v", err)
 	}
 }

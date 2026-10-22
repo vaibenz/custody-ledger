@@ -99,6 +99,10 @@ func TestEndToEndFlow(t *testing.T) {
 	if bal := e.must(200, e.call(alice, "GET", "/v1/accounts/"+aID, nil, ""))["balance"]; bal != 7_500.0 {
 		t.Errorf("alice balance %v", bal)
 	}
+	entries := e.must(200, e.call(alice, "GET", "/v1/accounts/"+aID+"/entries?limit=10", nil, ""))["entries"].([]any)
+	if len(entries) != 2 || entries[0].(map[string]any)["amount"] != -2_500.0 {
+		t.Errorf("alice entries %v", entries)
+	}
 	list := e.must(200, e.call(bob, "GET", "/v1/accounts", nil, ""))["accounts"].([]any)
 	if len(list) != 1 || list[0].(map[string]any)["balance"] != 2_500.0 {
 		t.Errorf("bob accounts %v", list)
@@ -215,6 +219,33 @@ func TestRevokedKeyStopsWorking(t *testing.T) {
 	}
 	if r := e.call(key, "GET", "/v1/accounts", nil, ""); r.status != 401 {
 		t.Errorf("revoked key: %d", r.status)
+	}
+}
+
+func TestRootAdminErrors(t *testing.T) {
+	e := newEnv(t)
+	e.must(201, e.call(rootToken, "POST", "/v1/admin/operators", map[string]any{"name": "ops-1"}, ""))
+	e.must(409, e.call(rootToken, "POST", "/v1/admin/operators", map[string]any{"name": "ops-1"}, ""))
+	e.must(400, e.call(rootToken, "POST", "/v1/admin/operators", map[string]any{"name": "has space"}, ""))
+	e.must(400, e.call(rootToken, "POST", "/v1/admin/keys", map[string]any{"owner": ""}, ""))
+	e.must(404, e.call(rootToken, "DELETE", "/v1/admin/keys/00000000-0000-0000-0000-000000000000", nil, ""))
+	e.must(400, e.call(rootToken, "DELETE", "/v1/admin/keys/not-a-uuid", nil, ""))
+}
+
+func TestOperatorReadsAndUnknownIDs(t *testing.T) {
+	e := newEnv(t)
+	op, alice, _ := e.credentials()
+	missing := "00000000-0000-0000-0000-000000000000"
+	e.must(404, e.call(op, "GET", "/v1/withdrawals/"+missing, nil, ""))
+	e.must(404, e.call(alice, "GET", "/v1/withdrawals/"+missing, nil, ""))
+	e.must(404, e.call(op, "POST", "/v1/reviews/"+missing+"/approve", nil, ""))
+	e.must(400, e.call(op, "POST", "/v1/reviews/nope/reject", nil, ""))
+	e.must(404, e.call(alice, "GET", "/v1/accounts/"+missing+"/entries", nil, ""))
+	if got := e.must(200, e.call(op, "GET", "/v1/audit/nothing-here", nil, ""))["entries"].([]any); len(got) != 0 {
+		t.Errorf("audit for unknown subject: %v", got)
+	}
+	if got := e.must(200, e.call(op, "GET", "/v1/reviews?limit=5", nil, ""))["withdrawals"].([]any); len(got) != 0 {
+		t.Errorf("reviews: %v", got)
 	}
 }
 

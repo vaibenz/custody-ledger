@@ -64,3 +64,12 @@ func TestZeroLimitsDisableRules(t *testing.T) {
 		t.Errorf("empty policy should approve, got %s %v", d.Outcome, d.Reasons)
 	}
 }
+
+func TestOutcomeNamesAndApprovals(t *testing.T) {
+	if Approve.String() != "approve" || Review.String() != "review" || Reject.String() != "reject" {
+		t.Error("outcome names")
+	}
+	if (Policy{}).Approvals() != 1 || (Policy{ReviewApprovals: 3}).Approvals() != 3 {
+		t.Error("approvals default")
+	}
+}
