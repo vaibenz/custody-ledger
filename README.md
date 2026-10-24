@@ -4,6 +4,8 @@
 
 A custodial wallet service in Go, built on a double entry ledger in PostgreSQL.
 
+I wanted to understand how a custodian keeps track of money it holds for other people, where one double counted withdrawal is a real loss. Most of the design below follows from that: a double entry ledger, idempotent requests, and careful locking.
+
 It holds customer balances across assets, moves value between them, and decides whether each withdrawal leaves custody automatically, waits for two humans to approve it, or is refused. The focus is correctness under concurrency and accountability:
 
 * Retried or simultaneous requests can never double spend.
@@ -18,7 +20,7 @@ go test -race ./...   # unit + integration tests against real Postgres, 84% stat
 
 ### Double entry ledger
 
-Every movement of value is a **transaction** made of **entries** that sum to zero. A deposit of 5,000 sats writes `external −5000, alice +5000`. Each asset has three kinds of account:
+Every movement of value is a transaction made of entries that sum to zero. A deposit of 5,000 sats writes `external −5000, alice +5000`. Each asset has three kinds of account:
 
 | Kind | Purpose |
 |---|---|
@@ -26,7 +28,7 @@ Every movement of value is a **transaction** made of **entries** that sum to zer
 | `external` | The outside world: the counterparty for deposits and settled withdrawals, so the only kind that goes negative. Sharded, see below. |
 | `hold` | Withdrawals waiting for review. Funds sit here so the customer cannot spend them twice. |
 
-The zero sum rule is enforced **by Postgres, not just by Go**. A deferred constraint trigger checks every transaction at commit and aborts it if its entries do not balance. Cached balances are updated in the same database transaction as the entries, and the tests assert after every scenario that each cached balance equals the sum of its entries.
+The zero sum rule is enforced by Postgres, not just by Go. A deferred constraint trigger checks every transaction at commit and aborts it if its entries do not balance. Cached balances are updated in the same database transaction as the entries, and the tests assert after every scenario that each cached balance equals the sum of its entries.
 
 All amounts are `int64` in the asset's smallest unit. Floating point never touches money.
 
@@ -34,10 +36,10 @@ All amounts are `int64` in the asset's smallest unit. Floating point never touch
 
 Every money moving call takes an `Idempotency-Key`. The posting engine inserts the transaction row first with `ON CONFLICT (idempotency_key) DO NOTHING`:
 
-* **Retry after success:** returns the original transaction with `replayed: true` (HTTP 200 instead of 201), and nothing moves.
-* **Concurrent retries:** the second insert blocks on the unique index until the first commits, then sees the conflict. `TestConcurrentRetriesApplyOnce` fires 50 identical requests at once and checks exactly one applies.
-* **Same key, different request:** a SHA 256 of the request is stored with the key, so this is a `409`, not a silent replay of the wrong thing.
-* **Failed request:** the whole database transaction rolls back, including the key, so the client can retry.
+* Retry after success: returns the original transaction with `replayed: true` (HTTP 200 instead of 201), and nothing moves.
+* Concurrent retries: the second insert blocks on the unique index until the first commits, then sees the conflict. `TestConcurrentRetriesApplyOnce` fires 50 identical requests at once and checks exactly one applies.
+* Same key, different request: a SHA 256 of the request is stored with the key, so this is a `409`, not a silent replay of the wrong thing.
+* Failed request: the whole database transaction rolls back, including the key, so the client can retry.
 
 ### Locking and double spend prevention
 
@@ -49,11 +51,11 @@ Every route needs `Authorization: Bearer <token>`. There are three kinds of call
 
 | Credential | Can | Cannot |
 |---|---|---|
-| **Customer** API key (`ck_...`) | open accounts, read and spend **their own** accounts, save addresses, withdraw | credit deposits, review, see anyone else's accounts |
-| **Operator** token (`op_...`), one per person | credit deposits (the chain watcher), review withdrawals, read the audit log | open accounts, issue keys |
-| **Root** (`ADMIN_TOKEN`) | create operators, issue and revoke customer keys | move money or review anything |
+| Customer API key (`ck_...`) | open accounts, read and spend their own accounts, save addresses, withdraw | credit deposits, review, see anyone else's accounts |
+| Operator token (`op_...`), one per person | credit deposits (the chain watcher), review withdrawals, read the audit log | open accounts, issue keys |
+| Root (`ADMIN_TOKEN`) | create operators, issue and revoke customer keys | move money or review anything |
 
-Keys are 256 bit random values. Only a SHA 256 of each is stored, so a database leak does not leak usable keys. A customer asking for someone else's account gets **404, not 403**, so account ids cannot be probed. `TestCustomersCannotTouchOthersAccounts` and `TestRolesAreEnforced` check every combination.
+Keys are 256 bit random values. Only a SHA 256 of each is stored, so a database leak does not leak usable keys. A customer asking for someone else's account gets 404, not 403, so account ids cannot be probed. `TestCustomersCannotTouchOthersAccounts` and `TestRolesAreEnforced` check every combination.
 
 ### Withdrawal risk engine
 
@@ -67,11 +69,11 @@ Keys are 256 bit random values. Only a SHA 256 of each is stored, so a database 
 | Destination was saved less than 24h ago | review |
 | Single amount above the review threshold | review |
 
-The customer's account row is locked **before** withdrawal history is read, so 20 concurrent withdrawals cannot jointly slip past a daily limit. Re-adding a saved address keeps its original timestamp, so it cannot reset the hold.
+The customer's account row is locked before withdrawal history is read, so 20 concurrent withdrawals cannot jointly slip past a daily limit. Re-adding a saved address keeps its original timestamp, so it cannot reset the hold.
 
 ### Four-eyes review
 
-A held withdrawal settles only after **two different operators** approve it. The count is configurable per asset and is copied onto each withdrawal when it is requested. Approvals are keyed by `(withdrawal, reviewer)`, so one person can never count twice, and a single rejection releases the funds back to the customer. The reviewer is always taken from the credential, never from the request body.
+A held withdrawal settles only after two different operators approve it. The count is configurable per asset and is copied onto each withdrawal when it is requested. Approvals are keyed by `(withdrawal, reviewer)`, so one person can never count twice, and a single rejection releases the funds back to the customer. The reviewer is always taken from the credential, never from the request body.
 
 ```
                  ┌── approve ──> user → external                          [approved]
@@ -84,7 +86,7 @@ request ─ risk ──┼── review ───> user → hold ──┬─ 2 
 
 ### Transactional outbox
 
-Approving a withdrawal, automatically or on the second review, inserts a `withdrawal.send` event in the **same database transaction**. So "approved" and "tell the signer to send it" either both happen or neither does. `cmd/relay` delivers events:
+Approving a withdrawal, automatically or on the second review, inserts a `withdrawal.send` event in the same database transaction. So "approved" and "tell the signer to send it" either both happen or neither does. `cmd/relay` delivers events:
 
 * It claims due events with `FOR UPDATE SKIP LOCKED`, so several relays can run at once without handing out the same event. A test has four relays drain 300 events, each delivered exactly once.
 * Failures retry with capped exponential backoff without blocking the events behind them.
@@ -146,8 +148,12 @@ Sharding the external account roughly doubles deposit throughput. Transfers do n
 
 See [`deploy/aws.md`](deploy/aws.md). A CloudFormation stack creates one EC2 instance running everything behind Caddy with automatic HTTPS, an ECR repository, and an OIDC role for GitHub Actions. After CI passes on `main`, the deploy workflow ships the new images with SSM Run Command and checks `/healthz`. No AWS keys are stored anywhere.
 
-## Limits and next steps
+## What I'd do next
 
-* **Address validation** is a loose format check. Real validation is per chain (bech32, EIP 55 checksums) and belongs in a chain adapter.
-* **One instance.** The deploy trades high availability for cost. Production would run Postgres on RDS Multi-AZ and the API behind a load balancer.
-* **Operators and keys** are managed through the API. A real system would put operators behind SSO with hardware second factors.
+* Address validation is a loose format check. Real validation is per chain (bech32, EIP 55 checksums) and belongs in a chain adapter.
+* One instance. The deploy trades high availability for cost. Production would run Postgres on RDS Multi-AZ and the API behind a load balancer.
+* Operators and keys are managed through the API. A real system would put operators behind SSO with hardware second factors.
+
+---
+
+If something here is unclear, broken, or just wrong, feel free to open an issue. I'm always happy to chat about it.
